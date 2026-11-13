@@ -1,94 +1,64 @@
 import AppKit
 import NeoFinderCore
-import Darwin
 
+/// Decides where Neo-Finder may change files. The app is not sandboxed, so macOS privacy
+/// settings (Full Disk Access and the per-folder prompts) decide what can be read at all.
+/// Safety comes from undoable operations rather than from a list of registered folders.
 @MainActor
 final class AccessManager {
-    private let store: SessionStore
-    private var scopes: [URL] = []
     private let defaults: UserDefaults
-    private(set) var writeRoots: [URL]
+    private static let remoteKey = "allowRemoteWrites"
 
-    init(store: SessionStore, defaults: UserDefaults = .standard) {
-        self.store = store
-        self.defaults = defaults
-        writeRoots = (defaults.stringArray(forKey: "localWriteRoots") ?? []).map { URL(fileURLWithPath: $0) }
-        scopes = store.restoreBookmarks().filter { $0.startAccessingSecurityScopedResource() }
+    /// Cloud-synced and network locations stay read-only until the user opts in.
+    var allowRemoteWrites: Bool {
+        get { defaults.bool(forKey: Self.remoteKey) }
+        set { defaults.set(newValue, forKey: Self.remoteKey) }
     }
 
-    func register(_ url: URL, localWrite: Bool) throws {
-        if !scopes.contains(where: { $0.standardizedFileURL == url.standardizedFileURL }), url.startAccessingSecurityScopedResource() {
-            scopes.append(url)
-        }
-        try store.saveBookmark(for: url)
-        if localWrite {
-            try Self.validateLocal(url)
-            let root = url.resolvingSymlinksInPath().standardizedFileURL
-            if !writeRoots.contains(root) { writeRoots.append(root) }
-            defaults.set(writeRoots.map(\.path), forKey: "localWriteRoots")
+    init(defaults: UserDefaults = .standard) { self.defaults = defaults }
+
+    /// `directory: true` checks a folder that will receive items; otherwise each URL is an item
+    /// that will itself be moved, renamed or trashed.
+    func requireWrite(_ urls: [URL], directory: Bool = false) throws {
+        for url in urls {
+            // Operate on a symbolic link itself, but judge the location by its real parent.
+            let location = directory ? url : url.deletingLastPathComponent()
+            if Self.isRemote(location) && !allowRemoteWrites {
+                throw NSError(domain: "NeoFinder", code: 2, userInfo: [NSLocalizedDescriptionKey:
+                    "「\(location.lastPathComponent)」はクラウド同期またはネットワーク上の場所です。編集するには、Neo-Finderメニューの「クラウド・ネットワーク上の編集を許可（実験的）」を有効にしてください。"])
+            }
+            if !directory && Self.isProtected(url) {
+                throw NSError(domain: "NeoFinder", code: 3, userInfo: [NSLocalizedDescriptionKey:
+                    "「\(url.lastPathComponent)」はシステムやホームの基本フォルダのため、Neo-Finderでは移動・名前変更・削除しません。必要な場合はFinderで操作してください。"])
+            }
         }
     }
 
     func isWriteEnabled(_ directory: URL) -> Bool { (try? requireWrite([directory], directory: true)) != nil }
 
-    func endAccess() {
-        for url in scopes { url.stopAccessingSecurityScopedResource() }
-        scopes.removeAll()
-    }
-
-    func requireWrite(_ urls: [URL], directory: Bool = false) throws {
-        for url in urls {
-            // Operate on a symbolic link itself, but never trust a symlinked parent.
-            let location = directory ? url : url.deletingLastPathComponent()
-            try Self.validateLocal(location)
-            if !directory {
-                let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey, .isUbiquitousItemKey])
-                if values.isUbiquitousItem == true { throw Self.unsupportedLocation() }
-                if values.isDirectory == true && values.isSymbolicLink != true {
-                    try Self.validateLocal(url)
-                    let canonicalItem = url.resolvingSymlinksInPath().standardizedFileURL
-                    if writeRoots.contains(canonicalItem) ||
-                        FileManager.default.fileExists(atPath: canonicalItem.appendingPathComponent("Library/CloudStorage").path) ||
-                        FileManager.default.fileExists(atPath: canonicalItem.appendingPathComponent("CloudStorage").path) ||
-                        FileManager.default.fileExists(atPath: canonicalItem.appendingPathComponent("Library/Mobile Documents").path) ||
-                        FileManager.default.fileExists(atPath: canonicalItem.appendingPathComponent("Mobile Documents").path) {
-                        throw NSError(domain: "NeoFinder", code: 3, userInfo: [NSLocalizedDescriptionKey: "登録した作業フォルダ自体やクラウド領域を含むフォルダは変更できません。必要な場合はFinderで操作してください。"])
-                    }
-                }
-            }
-            let canonical = location.resolvingSymlinksInPath().standardizedFileURL
-            guard writeRoots.contains(where: { Self.contains($0, canonical) }) else {
-                throw NSError(domain: "NeoFinder", code: 1, userInfo: [NSLocalizedDescriptionKey:
-                    "「\(location.lastPathComponent)」では編集が有効になっていません。「フォルダを登録」から、クラウド同期されていないローカルフォルダを登録してください。"])
-            }
-        }
-    }
-
-    static func contains(_ root: URL, _ child: URL) -> Bool {
-        let parent = root.resolvingSymlinksInPath().standardizedFileURL.path
-        let path = child.resolvingSymlinksInPath().standardizedFileURL.path
-        return path == parent || path.hasPrefix(parent == "/" ? "/" : parent + "/")
-    }
-
-    static func validateLocal(_ url: URL) throws {
+    /// iCloud Drive, File Provider storage (OneDrive, Dropbox, Google Drive …) and non-local volumes.
+    static func isRemote(_ url: URL) -> Bool {
         let canonical = url.resolvingSymlinksInPath().standardizedFileURL
-        let values = try canonical.resourceValues(forKeys: [.volumeIsLocalKey, .isUbiquitousItemKey])
-        let path = canonical.path
-        guard values.volumeIsLocal == true, values.isUbiquitousItem != true,
-              !path.contains("/Library/CloudStorage/"), !path.hasSuffix("/Library/CloudStorage"),
-              !path.contains("/Library/Mobile Documents/"), !path.hasSuffix("/Library/Mobile Documents") else {
-            throw unsupportedLocation()
+        let path = canonical.path + "/"
+        if path.contains("/Library/CloudStorage/") || path.contains("/Library/Mobile Documents/") { return true }
+        guard let values = try? canonical.resourceValues(forKeys: [.volumeIsLocalKey, .isUbiquitousItemKey]) else {
+            return false
         }
-        var info = statfs()
-        guard statfs(path, &info) == 0 else { throw unsupportedLocation() }
-        let format = withUnsafePointer(to: &info.f_fstypename) { pointer in
-            pointer.withMemoryRebound(to: CChar.self, capacity: 16) { String(cString: $0) }
-        }
-        guard format == "apfs" else { throw unsupportedLocation() }
+        return values.volumeIsLocal == false || values.isUbiquitousItem == true
     }
 
-    private static func unsupportedLocation() -> NSError {
-        NSError(domain: "NeoFinder", code: 2, userInfo: [NSLocalizedDescriptionKey:
-            "この初期版では、クラウド同期されていないローカルAPFSフォルダで編集できます。この場所はFinderで操作してください。"])
+    /// Items whose loss or rename would break the account or the system: volume roots, top-level
+    /// system folders, the home folder and its standard folders.
+    static func isProtected(_ url: URL) -> Bool {
+        let path = url.deletingLastPathComponent().resolvingSymlinksInPath()
+            .appendingPathComponent(url.lastPathComponent).standardizedFileURL.path
+        let components = path.split(separator: "/")
+        if components.count <= 1 { return true }
+        if components.count == 2 && (components[0] == "Users" || components[0] == "Volumes") { return true }
+        if path.hasPrefix("/System/") || path.hasPrefix("/usr/") || path.hasPrefix("/bin/") || path.hasPrefix("/sbin/") { return true }
+        let home = FileManager.default.homeDirectoryForCurrentUser.resolvingSymlinksInPath().standardizedFileURL.path
+        if path == home { return true }
+        let standard = ["Applications", "Desktop", "Documents", "Downloads", "Library", "Movies", "Music", "Pictures", "Public"]
+        return standard.contains { path == home + "/" + $0 }
     }
 }

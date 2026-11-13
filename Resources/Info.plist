@@ -6,12 +6,18 @@
 <key>CFBundleName</key><string>Neo-Finder</string>
 <key>CFBundleDisplayName</key><string>Neo-Finder</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.1.0</string>
-<key>CFBundleVersion</key><string>1</string>
+<key>CFBundleShortVersionString</key><string>0.2.0</string>
+<key>CFBundleVersion</key><string>2</string>
 <key>LSMinimumSystemVersion</key><string>26.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSPrincipalClass</key><string>NSApplication</string>
 <key>NSHumanReadableCopyright</key><string>Neo-Finder — personal local build</string>
+<key>NSAppleEventsUsageDescription</key><string>Finderの最前面ウインドウの場所と選択項目をNeo-Finderで開くために使います。</string>
+<key>NSDesktopFolderUsageDescription</key><string>デスクトップのファイルを表示・整理するために使います。</string>
+<key>NSDocumentsFolderUsageDescription</key><string>書類フォルダのファイルを表示・整理するために使います。</string>
+<key>NSDownloadsFolderUsageDescription</key><string>ダウンロードフォルダのファイルを表示・整理するために使います。</string>
+<key>NSRemovableVolumesUsageDescription</key><string>外付けディスクのファイルを表示・整理するために使います。</string>
+<key>NSNetworkVolumesUsageDescription</key><string>ネットワーク上のファイルを表示するために使います。</string>
 <key>CFBundleDocumentTypes</key><array><dict>
 <key>CFBundleTypeName</key><string>フォルダ</string>
 <key>LSItemContentTypes</key><array><string>public.folder</string></array>

@@ -4,6 +4,8 @@ import Darwin
 
 public enum ConflictPolicy: String, Codable, CaseIterable, Sendable {
     case keepBoth, skip, cancel
+    /// The existing item is moved to the Trash first, so the replacement stays undoable.
+    case replace
 }
 
 public struct OperationReport: Codable, Sendable {
@@ -21,7 +23,8 @@ public struct OperationReport: Codable, Sendable {
 }
 
 /// A synchronous engine. Call it on a background serial queue; cancellation is thread-safe.
-/// No operation replaces an existing item. Undo is restricted to this engine's lifetime.
+/// An existing item is never overwritten in place: `.replace` moves it to the Trash first.
+/// Undo is restricted to this engine's lifetime.
 public final class FileOperationEngine {
     public typealias TrashHandler = (URL) throws -> URL
 
@@ -35,6 +38,10 @@ public final class FileOperationEngine {
     private var journalReadError: String?
     private var undoStack: [[UndoAction]] = []
     private var coordinationStack: [NSFileCoordinator] = []
+    /// Side effects of the item being processed (a displaced old version, a trashed original).
+    /// `perform` records them for Undo even when the item's main step fails afterwards.
+    private var pendingActions: [UndoAction] = []
+    private var pendingWarnings: [String] = []
     /// Set only from the journal present at initialization; no previous work is resumed automatically.
     public private(set) var recoveryNotice: String?
 
@@ -196,9 +203,22 @@ public final class FileOperationEngine {
             try self.coordinated(source, directory: directory, moving: moving) { source, directory in
                 try self.validateTransfer(source, to: directory, moving: moving)
                 let proposed = directory.appendingPathComponent(source.lastPathComponent)
-                let target = try self.availableDestination(proposed, conflict: conflict)
-                guard let target else { return nil }
+                let target: URL
+                if conflict == .replace, try self.optionalStat(proposed) != nil {
+                    try self.displace(proposed, keeping: source)
+                    target = proposed
+                } else {
+                    guard let available = try self.availableDestination(proposed, conflict: conflict) else { return nil }
+                    target = available
+                }
+                // Another volume cannot be reached by rename: copy, verify, then trash the original.
+                var crossVolume = false
                 if moving {
+                    let destinationDevice = try self.stat(directory.resolvingSymlinksInPath()).st_dev
+                    let sourceDevice = try self.stat(source).st_dev
+                    crossVolume = destinationDevice != sourceDevice
+                }
+                if moving && !crossVolume {
                     try self.exclusiveMove(source, to: target)
                     return self.mutationResult(url: target, undoKind: .relocate(original: source))
                 }
@@ -219,7 +239,9 @@ public final class FileOperationEngine {
                 }
                 // A conflict appearing after preflight is an error, never an overwrite.
                 try self.exclusiveMove(payload, to: target)
-                return self.mutationResult(url: target, undoKind: .removeCopy)
+                let copiedResult = self.mutationResult(url: target, undoKind: .removeCopy)
+                if crossVolume { self.trashOriginalAfterCopy(source, before: before) }
+                return copiedResult
             }
         }
     }
@@ -234,26 +256,76 @@ public final class FileOperationEngine {
         var failures: [String] = []
         for source in sources {
             if isCancelled { break }
+            pendingActions.removeAll()
+            pendingWarnings.removeAll()
+            var mainAction: UndoAction?
+            var stop = false
             do {
                 try markActive(entryID, url: source)
                 if let result = try body(source) {
                     completed += 1
                     if let fingerprint = result.fingerprint {
-                        actions.append(UndoAction(url: result.url, kind: result.undoKind, fingerprint: fingerprint))
+                        mainAction = UndoAction(url: result.url, kind: result.undoKind, fingerprint: fingerprint)
                     } else {
                         failures.append("\(source.lastPathComponent): 操作は完了しましたが取消用の確認ができません: \(result.warning ?? "不明なエラー")")
                     }
                 }
             } catch EngineError.conflictCancelled {
                 cancel()
-                break
+                stop = true
             } catch {
                 failures.append("\(source.lastPathComponent): \(error.localizedDescription)")
             }
+            // Undo runs in reverse: the main step is reverted before the displaced item returns.
+            actions.append(contentsOf: pendingActions)
+            if let mainAction { actions.append(mainAction) }
+            failures.append(contentsOf: pendingWarnings.map { "\(source.lastPathComponent): \($0)" })
+            pendingActions.removeAll()
+            pendingWarnings.removeAll()
+            if stop { break }
             updateJournal(entryID, completed: completed, failures: failures, finished: false)
         }
         if !actions.isEmpty { undoStack.append(actions) }
         return finish(entryID, kind: kind, completed: completed, failures: failures)
+    }
+
+    /// Moves the item occupying a destination to the Trash and registers its restoration for Undo.
+    private func displace(_ existing: URL, keeping source: URL) throws {
+        let occupied = existing.resolvingSymlinksInPath().standardizedFileURL.path
+        let kept = source.deletingLastPathComponent().resolvingSymlinksInPath()
+            .appendingPathComponent(source.lastPathComponent).standardizedFileURL.path
+        guard kept != occupied, !kept.hasPrefix(occupied + "/") else {
+            throw EngineError.message("置き換える項目の中に元の項目があるため、置き換えできません。")
+        }
+        let before = try fingerprint(existing)
+        guard let trashed = try sendToTrash(existing) else {
+            pendingWarnings.append("置き換えた旧「\(existing.lastPathComponent)」のゴミ箱内の場所を取得できません。取り消しでは戻りません。")
+            return
+        }
+        let result = trashMutationResult(url: trashed, original: existing, before: before)
+        if let fingerprint = result.fingerprint {
+            pendingActions.append(UndoAction(url: trashed, kind: .relocate(original: existing), fingerprint: fingerprint))
+        } else {
+            pendingWarnings.append("置き換えた旧「\(existing.lastPathComponent)」はゴミ箱にありますが、取り消しでは戻りません: \(result.warning ?? "確認できません")")
+        }
+    }
+
+    /// The copy is already verified and in place. A failure here leaves both items and says so.
+    private func trashOriginalAfterCopy(_ source: URL, before: Fingerprint) {
+        do {
+            guard let trashed = try sendToTrash(source) else {
+                pendingWarnings.append("元の項目はゴミ箱へ移しましたが、取り消しでは戻りません。")
+                return
+            }
+            let result = trashMutationResult(url: trashed, original: source, before: before)
+            if let fingerprint = result.fingerprint {
+                pendingActions.append(UndoAction(url: trashed, kind: .relocate(original: source), fingerprint: fingerprint))
+            } else {
+                pendingWarnings.append("元の項目はゴミ箱にありますが、取り消しでは戻りません: \(result.warning ?? "確認できません")")
+            }
+        } catch {
+            pendingWarnings.append("コピーは完了しましたが、元の項目をゴミ箱へ移せませんでした。元の項目は残っています: \(error.localizedDescription)")
+        }
     }
 
     private func availableDestination(_ proposed: URL, conflict: ConflictPolicy) throws -> URL? {
@@ -261,7 +333,7 @@ public final class FileOperationEngine {
         switch conflict {
         case .skip: return nil
         case .cancel: throw EngineError.conflictCancelled
-        case .keepBoth:
+        case .keepBoth, .replace:
             let info = try stat(proposed)
             let isDirectory = info.st_mode & S_IFMT == S_IFDIR
             let ext = isDirectory ? "" : proposed.pathExtension
@@ -353,9 +425,6 @@ public final class FileOperationEngine {
            destinationDirectory.path == sourcePath || destinationDirectory.path.hasPrefix(sourcePath + "/") {
             throw EngineError.message("フォルダを自分自身またはその中へ転送できません。")
         }
-        if moving, try stat(destinationDirectory).st_dev != sourceStat.st_dev {
-            throw EngineError.message("別ボリュームへの移動には未対応です。コピーを使用してください。")
-        }
     }
 
     private func exclusiveMove(_ source: URL, to destination: URL) throws {
@@ -363,9 +432,21 @@ public final class FileOperationEngine {
             throw EngineError.message("移動のアクセス調整がありません。")
         }
         notifier.item(at: source, willMoveTo: destination)
-        let result = source.withUnsafeFileSystemRepresentation { sourcePath in
+        var result = source.withUnsafeFileSystemRepresentation { sourcePath in
             destination.withUnsafeFileSystemRepresentation { destinationPath in
                 renamex_np(sourcePath!, destinationPath!, UInt32(RENAME_EXCL))
+            }
+        }
+        if result != 0 && errno == ENOTSUP {
+            // exFAT, FAT and some network volumes have no exclusive rename. Check, then rename.
+            guard try optionalStat(destination) == nil else {
+                errno = EEXIST
+                throw posixError(destination)
+            }
+            result = source.withUnsafeFileSystemRepresentation { sourcePath in
+                destination.withUnsafeFileSystemRepresentation { destinationPath in
+                    Darwin.rename(sourcePath!, destinationPath!)
+                }
             }
         }
         guard result == 0 else { throw posixError(destination) }

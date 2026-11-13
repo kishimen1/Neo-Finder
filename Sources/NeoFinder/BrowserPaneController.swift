@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import NeoFinderCore
 
 /// One independent Finder-style browser. File mutations are delegated to the window's operation service.
@@ -35,7 +36,25 @@ final class BrowserPaneController: NSViewController, NSTableViewDataSource, NSTa
     var onStateChange: (() -> Void)?
     var onOpen: (([URL]) -> Void)?
     var onPreview: (([URL]) -> Void)?
-    var onRename: ((URL) -> Void)?
+    var onRename: ((URL, String) -> Void)?
+    var onSelectionChange: (() -> Void)?
+    var onEntriesChange: (() -> Void)?
+    var onNavigate: ((URL) -> Void)?
+    var onFocusOther: (() -> Void)?
+    var onTabActivated: (() -> Void)?
+    /// ⌘Return / ⇧⌘Return in the list: copy (false) or move (true) the selection to the other pane.
+    var onTransferToOther: ((Bool) -> Void)?
+    /// Lets the window claim a key before the list handles it (used by triage mode).
+    var keyInterceptor: ((NSEvent) -> Bool)?
+    /// Everything read from the current folder, before the filter is applied.
+    var entries: [FileEntry] { allEntries }
+    /// Per-name marks from a left/right comparison; nil when no comparison is shown.
+    var comparison: [String: CompareStatus]? { didSet { if isViewLoaded { refreshNameCells() } } }
+    private var flatPath: String?
+    /// True while the list shows every descendant of the current folder instead of its direct children.
+    var isFlat: Bool { flatPath == currentURL.path && currentTab.viewMode == .list }
+    var currentTemplate: String? { currentTab.template }
+    var isRenaming: Bool { renameField != nil }
     var onDelete: (([URL]) -> Void)?
     var onDrop: (([URL], URL, Bool) -> Void)?
     var onRequestAccess: ((URL) -> Void)?
@@ -58,7 +77,7 @@ final class BrowserPaneController: NSViewController, NSTableViewDataSource, NSTa
     private let columnStack = NSStackView()
     private let messageStack = NSStackView()
     private let messageLabel = NSTextField(wrappingLabelWithString: "")
-    private let accessButton = NSButton(title: "フォルダを選択してアクセスを許可…", target: nil, action: nil)
+    private let accessButton = NSButton(title: "フルディスクアクセスの設定を開く…", target: nil, action: nil)
     private let statusLabel = NSTextField(labelWithString: "")
     private let filterBadge = NSTextField(labelWithString: "")
     private var allEntries: [FileEntry] = []
@@ -73,7 +92,20 @@ final class BrowserPaneController: NSViewController, NSTableViewDataSource, NSTa
     private var loadError: Error?
     private var loading = false
     private var initialRead = false
-    private var pendingRead: (path: String, tab: UUID, mode: BrowserViewMode, hidden: Bool)?
+    private var pendingRead: (path: String, tab: UUID, mode: BrowserViewMode, hidden: Bool, flat: Bool)?
+    private weak var renameField: NSTextField?
+    private var renameURL: URL?
+    private var renameOriginal = ""
+    private var renameDisplay = ""
+    private var renameCancelled = false
+    private var renameAdvance = 0
+    private var deferredReload = false
+    private var watchSource: DispatchSourceFileSystemObject?
+    private var watchedPath: String?
+    private var watchWork: DispatchWorkItem?
+    private var advanceRow: Int?
+    private var advanceDeadline = Date.distantPast
+    private var pendingReveal: (urls: [URL], rename: Bool, deadline: Date)?
     private var renderedConfiguration: RenderConfiguration?
     private var lastDateRefresh = Date.distantPast
     private var changingSelection = false
@@ -406,14 +438,15 @@ final class BrowserPaneController: NSViewController, NSTableViewDataSource, NSTa
             row.orientation = .horizontal
             row.spacing = 0
             let url = URL(fileURLWithPath: tab.path)
-            let button = NSButton(title: url.path == "/" ? "Macintosh HD" : url.lastPathComponent, target: self, action: #selector(tabClicked(_:)))
+            let tabName = url.path == "/" ? "Macintosh HD" : url.lastPathComponent
+            let button = NSButton(title: tab.template == nil ? tabName : "↻ " + tabName, target: self, action: #selector(tabClicked(_:)))
             button.tag = index
             button.bezelStyle = .roundRect
             button.setButtonType(.pushOnPushOff)
             button.state = tab.id == paneState.selectedTabID ? .on : .off
             button.controlSize = .small
             button.font = .systemFont(ofSize: 11, weight: tab.id == paneState.selectedTabID ? .semibold : .regular)
-            button.toolTip = tab.path
+            button.toolTip = tab.template.map { tab.path + "\n日付連動: " + $0 } ?? tab.path
             button.setAccessibilityLabel("タブ: \(tab.path)")
             button.widthAnchor.constraint(lessThanOrEqualToConstant: 150).isActive = true
             button.lineBreakMode = .byTruncatingMiddle
@@ -429,7 +462,7 @@ final class BrowserPaneController: NSViewController, NSTableViewDataSource, NSTa
         columnsScroll.isHidden = currentTab.viewMode != .columns
     }
 
-    func navigate(to url: URL) {
+    func navigate(to url: URL, activating: Bool = true) {
         let destination = url.standardizedFileURL
         guard destination.path != currentURL.path else { reload(); return }
         rememberSelection()
@@ -437,10 +470,238 @@ final class BrowserPaneController: NSViewController, NSTableViewDataSource, NSTa
         tab.navigate(to: destination.path)
         paneState.tabs[currentTabIndex] = tab
         filterField.stringValue = ""
+        if activating { activate() }
+        updateNavigation()
+        onStateChange?()
+        onNavigate?(destination)
+        reload()
+    }
+
+    /// Makes the current tab follow the calendar (see `PathTemplate`), or an ordinary tab again with nil.
+    func setTemplate(_ template: String?) {
+        paneState.tabs[currentTabIndex].template = template
+        updateNavigation()
+        onStateChange?()
+    }
+
+    /// Where the current tab's template points today, when that differs from the shown folder.
+    func templateDestination() -> URL? {
+        guard let path = currentTab.templatePath(), path != currentTab.path else { return nil }
+        return URL(fileURLWithPath: path, isDirectory: true)
+    }
+
+    /// Shows every descendant of the current folder in one list, or returns to the direct children.
+    func toggleFlat() {
+        if isFlat { flatPath = nil }
+        else {
+            if currentTab.viewMode != .list { setViewMode(.list) }
+            flatPath = currentURL.path
+        }
+        activate()
+        reload()
+    }
+
+    func selectAdjacentTab(_ delta: Int) {
+        let count = paneState.tabs.count
+        guard count > 1 else { return }
+        selectTab(at: (currentTabIndex + delta + count) % count)
+    }
+
+    private func selectTab(at index: Int) {
+        guard paneState.tabs.indices.contains(index) else { return }
+        rememberSelection()
+        paneState.selectedTabID = paneState.tabs[index].id
+        filterField.stringValue = ""
         activate()
         updateNavigation()
         onStateChange?()
         reload()
+        onTabActivated?()
+    }
+
+    /// Moves the selection up or down by `delta` rows in the current list.
+    func selectRelative(_ delta: Int) {
+        guard let table = visibleCurrentTable, table.numberOfRows > 0 else { return }
+        let current = table.selectedRowIndexes.last ?? -1
+        let row = min(max(0, current + delta), table.numberOfRows - 1)
+        selectionTable = table
+        selectQuietly(IndexSet(integer: row), in: table)
+    }
+
+    /// Selects the items a comparison marked as missing on the other side, newer, or different.
+    @discardableResult
+    func selectDifferences() -> Int {
+        guard let comparison, let table = visibleCurrentTable, let model = tableModels[ObjectIdentifier(table)] else { return 0 }
+        let wanted: Set<CompareStatus> = [.onlyHere, .newer, .different]
+        let rows = IndexSet(model.entries.indices.filter { wanted.contains(comparison[model.entries[$0].name] ?? .same) })
+        selectionTable = table
+        selectQuietly(rows, in: table)
+        focusFiles()
+        return rows.count
+    }
+
+    /// Selects the given items once the list contains them, optionally starting an inline rename.
+    func reveal(_ urls: [URL], rename: Bool = false) {
+        pendingReveal = (urls, rename, Date().addingTimeInterval(5))
+        processPendingReveal()
+        if pendingReveal != nil { reload() }
+    }
+
+    /// Remembers the selected row so the next item is selected after the selection is moved away or trashed.
+    func prepareAdvance() {
+        guard let table = visibleCurrentTable, let first = table.selectedRowIndexes.first else { return }
+        advanceRow = first
+        advanceDeadline = Date().addingTimeInterval(8)
+    }
+
+    private func selectQuietly(_ indexes: IndexSet, in table: NSTableView) {
+        changingSelection = true
+        table.selectRowIndexes(indexes, byExtendingSelection: false)
+        changingSelection = false
+        if let first = indexes.first { table.scrollRowToVisible(first) }
+        updateStatus()
+        onSelectionChange?()
+    }
+
+    private func processPendingReveal() {
+        guard let pending = pendingReveal, renameField == nil,
+              let table = visibleCurrentTable, let model = tableModels[ObjectIdentifier(table)] else { return }
+        let paths = Set(pending.urls.map { $0.standardizedFileURL.path })
+        let rows = IndexSet(model.entries.indices.filter { paths.contains(model.entries[$0].url.standardizedFileURL.path) })
+        if rows.isEmpty {
+            if Date() > pending.deadline { pendingReveal = nil }
+            return
+        }
+        pendingReveal = nil
+        advanceRow = nil
+        selectionTable = table
+        selectQuietly(rows, in: table)
+        if pending.rename { DispatchQueue.main.async { [weak self] in self?.beginRename() } }
+    }
+
+    private func applyAdvance() {
+        guard let row = advanceRow, let table = visibleCurrentTable else { return }
+        if Date() > advanceDeadline { advanceRow = nil; return }
+        guard table.selectedRowIndexes.isEmpty, loadError == nil else { return }
+        advanceRow = nil
+        guard table.numberOfRows > 0 else { return }
+        selectionTable = table
+        selectQuietly(IndexSet(integer: min(row, table.numberOfRows - 1)), in: table)
+    }
+
+    private func refreshNameCells() {
+        guard renameField == nil else { deferredReload = true; return }
+        for table in [listTable] + columnTables where table.numberOfRows > 0 {
+            let column = table.column(withIdentifier: NSUserInterfaceItemIdentifier("name"))
+            guard column >= 0 else { continue }
+            table.reloadData(forRowIndexes: IndexSet(integersIn: 0..<table.numberOfRows), columnIndexes: IndexSet(integer: column))
+        }
+    }
+
+    // MARK: Inline rename
+
+    /// Edits the selected item's name in place. Return or a click elsewhere commits, Escape cancels,
+    /// Tab commits and moves on to the next item.
+    func beginRename() {
+        guard renameField == nil, selectedURLs.count == 1,
+              let table = selectionTable ?? visibleCurrentTable,
+              let model = tableModels[ObjectIdentifier(table)], model.entries.indices.contains(table.selectedRow) else { return }
+        let row = table.selectedRow
+        let column = table.column(withIdentifier: NSUserInterfaceItemIdentifier("name"))
+        guard column >= 0 else { return }
+        table.scrollRowToVisible(row)
+        guard let cell = table.view(atColumn: column, row: row, makeIfNecessary: true) as? BrowserNameCell,
+              let field = cell.textField else { return }
+        let entry = model.entries[row]
+        renameURL = entry.url
+        renameOriginal = entry.url.lastPathComponent
+        renameDisplay = field.stringValue
+        renameCancelled = false
+        renameAdvance = 0
+        field.stringValue = renameOriginal
+        field.isEditable = true
+        field.isSelectable = true
+        field.drawsBackground = true
+        field.backgroundColor = .textBackgroundColor
+        field.delegate = self
+        renameField = field
+        activate()
+        guard view.window?.makeFirstResponder(field) == true else {
+            renameCancelled = true
+            finishRename()
+            return
+        }
+        if let editor = field.currentEditor() {
+            // Like Finder, leave the extension out of the initial selection.
+            let name = renameOriginal as NSString
+            let ext = name.pathExtension
+            let folder = entry.isDirectory && !entry.isPackage
+            let length = folder || ext.isEmpty || name.length <= (ext as NSString).length + 1 ? name.length : name.length - (ext as NSString).length - 1
+            editor.selectedRange = NSRange(location: 0, length: length)
+        }
+    }
+
+    private func finishRename() {
+        guard let field = renameField, let url = renameURL else { return }
+        let newName = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let commit = !renameCancelled && !newName.isEmpty && newName != renameOriginal
+        let advance = renameCancelled ? 0 : renameAdvance
+        renameField = nil
+        renameURL = nil
+        renameAdvance = 0
+        field.delegate = nil
+        field.isEditable = false
+        field.isSelectable = false
+        field.drawsBackground = false
+        field.stringValue = renameDisplay
+        if commit {
+            if advance == 0 {
+                pendingReveal = ([url.deletingLastPathComponent().appendingPathComponent(newName)], false, Date().addingTimeInterval(5))
+            }
+            onRename?(url, newName)
+        }
+        if advance != 0, let table = visibleCurrentTable, table.selectedRow >= 0 {
+            let next = table.selectedRow + advance
+            if next >= 0 && next < table.numberOfRows {
+                selectionTable = table
+                selectQuietly(IndexSet(integer: next), in: table)
+                DispatchQueue.main.async { [weak self] in self?.beginRename() }
+                return
+            }
+        }
+        if deferredReload {
+            deferredReload = false
+            reload()
+        }
+    }
+
+    // MARK: Folder watching
+
+    /// Reloads soon after the shown folder gains, loses or renames an entry. The window's timer
+    /// still catches changes this cannot see, such as a file's size growing.
+    private func watch(_ url: URL) {
+        guard watchedPath != url.path else { return }
+        watchSource?.cancel()
+        watchSource = nil
+        watchedPath = url.path
+        let descriptor = Darwin.open(url.path, O_EVTONLY)
+        guard descriptor >= 0 else { return }
+        let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: descriptor,
+                                                               eventMask: [.write, .rename, .delete, .extend, .attrib],
+                                                               queue: .main)
+        source.setEventHandler { [weak self] in
+            MainActor.assumeIsolated { self?.scheduleWatchedReload() }
+        }
+        source.setCancelHandler { _ = Darwin.close(descriptor) }
+        source.resume()
+        watchSource = source
+    }
+
+    private func scheduleWatchedReload() {
+        watchWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.reload() }
+        watchWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
     }
 
     func addTab(url: URL? = nil) {
@@ -541,21 +802,28 @@ final class BrowserPaneController: NSViewController, NSTableViewDataSource, NSTa
 
     private var visibleCurrentTable: BrowserFileTable? { currentTab.viewMode == .list ? listTable : columnTables.last }
 
-    private func rememberSelection() { rememberedSelections[currentTab.id] = selectedURLs }
+    private func rememberSelection() {
+        rememberedSelections[currentTab.id] = selectedURLs
+        advanceRow = nil
+    }
 
     /// Read metadata away from the UI thread. A generation guard rejects results for a tab that was left meanwhile.
     func reload() {
         guard isViewLoaded else { return }
+        // Rebuilding rows would discard a name being typed; catch up when the edit ends.
+        if renameField != nil { deferredReload = true; return }
         let url = currentURL
         let hidden = showHidden
         let mode = currentTab.viewMode
         let tabID = currentTab.id
+        let flatMode = isFlat
+        watch(url)
         if loading, let pendingRead,
            pendingRead.path == url.path, pendingRead.tab == tabID,
-           pendingRead.mode == mode, pendingRead.hidden == hidden { return }
+           pendingRead.mode == mode, pendingRead.hidden == hidden, pendingRead.flat == flatMode { return }
         generation += 1
         let request = generation
-        pendingRead = (url.path, tabID, mode, hidden)
+        pendingRead = (url.path, tabID, mode, hidden, flatMode)
         let ancestors = mode == .columns ? ancestorURLs(for: url) : []
         let samePath = loadedPath == url.path && loadedTabID == tabID
         initialRead = !samePath || renderedConfiguration == nil
@@ -576,7 +844,10 @@ final class BrowserPaneController: NSViewController, NSTableViewDataSource, NSTa
         updateStatus()
         updateMessage()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let result = Result { try FolderReader.contents(of: url, showHidden: hidden) }
+            let result = Result {
+                try flatMode ? FolderReader.flatContents(of: url, showHidden: hidden)
+                             : FolderReader.contents(of: url, showHidden: hidden)
+            }
             let parentResults: [(URL, [FileEntry], String?)] = ancestors.map { parent in
                 do { return (parent, try FolderReader.contents(of: parent, showHidden: hidden), nil) }
                 catch { return (parent, [], error.localizedDescription) }
@@ -585,6 +856,7 @@ final class BrowserPaneController: NSViewController, NSTableViewDataSource, NSTa
                 guard let self, self.generation == request else { return }
                 self.loading = false
                 self.pendingRead = nil
+                if self.renameField != nil { self.deferredReload = true; return }
                 self.loadedPath = url.path
                 self.loadedTabID = tabID
                 let parentErrors = Dictionary(uniqueKeysWithValues: parentResults.compactMap { parent in
@@ -604,6 +876,7 @@ final class BrowserPaneController: NSViewController, NSTableViewDataSource, NSTa
                         if self.relativeDates && Date().timeIntervalSince(self.lastDateRefresh) >= 60 { self.refreshCellDisplays() }
                         self.updateStatus()
                         self.updateMessage()
+                        self.processPendingReveal()
                         return
                     }
                     self.allEntries = entries
@@ -615,6 +888,7 @@ final class BrowserPaneController: NSViewController, NSTableViewDataSource, NSTa
                 self.ancestorLoadErrors = parentErrors
                 self.applyFilter()
                 self.updateMessage()
+                self.onEntriesChange?()
             }
         }
     }
@@ -656,6 +930,7 @@ final class BrowserPaneController: NSViewController, NSTableViewDataSource, NSTa
     }
 
     private func applyFilter() {
+        if renameField != nil { deferredReload = true; return }
         let snapshots = tableSnapshots()
         let oldSelectionPath = selectionTable.flatMap { tableModels[ObjectIdentifier($0)]?.url.path }
         let filtered = FileEntry.filtered(allEntries, query: filterField.stringValue, sort: currentTab.sort, ascending: currentTab.ascending)
@@ -666,6 +941,9 @@ final class BrowserPaneController: NSViewController, NSTableViewDataSource, NSTa
             lastDateRefresh = Date()
             updateStatus()
             updateMessage()
+            processPendingReveal()
+            applyAdvance()
+            onSelectionChange?()
         }
         tableModels[ObjectIdentifier(listTable)] = TableModel(url: currentURL, current: true, entries: filtered)
         listTable.sortDescriptors = [NSSortDescriptor(key: sortKey(currentTab.sort), ascending: currentTab.ascending)]
@@ -756,7 +1034,11 @@ final class BrowserPaneController: NSViewController, NSTableViewDataSource, NSTa
         else if loadError != nil { statusLabel.stringValue = "この場所を読み込めません" }
         else if !filterField.stringValue.isEmpty { statusLabel.stringValue = "\(allEntries.count)項目中 \(visible)項目" + (selected > 0 ? " ・ \(selected)項目を選択" : "") }
         else { statusLabel.stringValue = "\(allEntries.count)項目" + (selected > 0 ? " ・ \(selected)項目を選択" : "") }
-        filterBadge.stringValue = filterField.stringValue.isEmpty ? "" : "絞り込み中"
+        var badges: [String] = []
+        if isFlat { badges.append(allEntries.count >= 20_000 ? "階層を展開中（上限2万件）" : "階層を展開中") }
+        if comparison != nil { badges.append("比較中") }
+        if !filterField.stringValue.isEmpty { badges.append("絞り込み中") }
+        filterBadge.stringValue = badges.joined(separator: " ・ ")
     }
 
     private func updateMessage() {
@@ -805,6 +1087,7 @@ final class BrowserPaneController: NSViewController, NSTableViewDataSource, NSTa
             cell.textField?.stringValue = item.name
             cell.arrow.isHidden = !(currentTab.viewMode == .columns && item.isDirectory && !item.isPackage)
             cell.tagMark.isHidden = item.tags.isEmpty
+            cell.setStatus(model.current ? comparison?[item.name] : nil)
             cell.toolTip = item.name + (item.tags.isEmpty ? "" : "\nタグ: " + item.tags.joined(separator: "、"))
             cell.setAccessibilityLabel(item.name + (item.isDirectory ? "、フォルダ" : "") + (item.isSymbolicLink ? "、シンボリックリンク" : ""))
             return cell
@@ -837,6 +1120,7 @@ final class BrowserPaneController: NSViewController, NSTableViewDataSource, NSTa
         selectionTable = table
         activate()
         updateStatus()
+        onSelectionChange?()
         if !table.isHandlingMouseDown && !table.isContextSelection { openSelectedColumnFolder(in: table) }
     }
 
@@ -882,11 +1166,33 @@ final class BrowserPaneController: NSViewController, NSTableViewDataSource, NSTa
     func controlTextDidBeginEditing(_ notification: Notification) { activate() }
 
     func controlTextDidEndEditing(_ notification: Notification) {
+        if let field = notification.object as? NSTextField, renameField != nil, field === renameField {
+            finishRename()
+            return
+        }
         guard notification.object as? NSSearchField === filterField else { return }
         scheduleFilter()
     }
 
     func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        if renameField != nil, control === renameField {
+            guard !textView.hasMarkedText() else { return false }
+            if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+                renameCancelled = true
+                focusFiles()
+                return true
+            }
+            if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+                focusFiles()
+                return true
+            }
+            if commandSelector == #selector(NSResponder.insertTab(_:)) || commandSelector == #selector(NSResponder.insertBacktab(_:)) {
+                renameAdvance = commandSelector == #selector(NSResponder.insertTab(_:)) ? 1 : -1
+                focusFiles()
+                return true
+            }
+            return false
+        }
         if control === filterField && commandSelector == #selector(NSResponder.cancelOperation(_:)) {
             guard !textView.hasMarkedText() else { return false }
             filterField.stringValue = ""
@@ -911,9 +1217,15 @@ final class BrowserPaneController: NSViewController, NSTableViewDataSource, NSTa
     }
 
     private func handleTableKey(_ event: NSEvent) -> Bool {
+        if keyInterceptor?(event) == true { return true }
         let modifiers = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        if event.keyCode == 48 && (modifiers.isEmpty || modifiers == .shift) { onFocusOther?(); return true }
+        if event.keyCode == 36 && (modifiers == .command || modifiers == [.command, .shift]) {
+            onTransferToOther?(modifiers.contains(.shift))
+            return true
+        }
         if modifiers.isEmpty {
-            if event.keyCode == 36 || event.keyCode == 76 { renameSelection(); return true }
+            if event.keyCode == 36 || event.keyCode == 76 { beginRename(); return true }
             if event.keyCode == 49 { previewSelection(); return true }
             if currentTab.viewMode == .columns && event.keyCode == 123 { goUp(); return true }
             if currentTab.viewMode == .columns && event.keyCode == 124 { openSelection(); focusFiles(); return true }
@@ -937,12 +1249,12 @@ final class BrowserPaneController: NSViewController, NSTableViewDataSource, NSTa
     }
 
     private func previewSelection() { let urls = selectedURLs; if !urls.isEmpty { onPreview?(urls) } }
-    private func renameSelection() { if selectedURLs.count == 1, let url = selectedURLs.first { onRename?(url) } }
+    private func renameSelection() { beginRename() }
     private func deleteSelection() { let urls = selectedURLs; if !urls.isEmpty { onDelete?(urls) } }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        for (title, selector) in [("開く", #selector(openClicked)), ("クイックルック", #selector(previewClicked)), ("名前を変更…", #selector(renameClicked)), ("Finderで表示", #selector(revealClicked))] {
+        for (title, selector) in [("開く", #selector(openClicked)), ("クイックルック", #selector(previewClicked)), ("名前を変更", #selector(renameClicked)), ("Finderで表示", #selector(revealClicked))] {
             let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
             item.target = self
             item.isEnabled = !selectedURLs.isEmpty && (selector != #selector(renameClicked) || selectedURLs.count == 1)
@@ -1027,14 +1339,7 @@ final class BrowserPaneController: NSViewController, NSTableViewDataSource, NSTa
         openSelection()
     }
     @objc private func tabClicked(_ sender: NSButton) {
-        guard paneState.tabs.indices.contains(sender.tag) else { return }
-        rememberSelection()
-        paneState.selectedTabID = paneState.tabs[sender.tag].id
-        filterField.stringValue = ""
-        activate()
-        updateNavigation()
-        onStateChange?()
-        reload()
+        selectTab(at: sender.tag)
     }
     @objc private func closeTabClicked(_ sender: NSButton) {
         guard paneState.tabs.indices.contains(sender.tag) else { return }
@@ -1090,6 +1395,25 @@ private final class BrowserFileTable: NSTableView {
 private final class BrowserNameCell: NSTableCellView {
     let arrow = NSImageView()
     let tagMark = NSImageView()
+    let statusMark = NSTextField(labelWithString: "")
+
+    /// Shows the result of a left/right comparison next to the name.
+    func setStatus(_ status: CompareStatus?) {
+        switch status {
+        case .onlyHere?:
+            statusMark.stringValue = "＋"; statusMark.textColor = .systemGreen; statusMark.toolTip = "反対側にありません"
+        case .newer?:
+            statusMark.stringValue = "新"; statusMark.textColor = .systemOrange; statusMark.toolTip = "こちらが新しい"
+        case .older?:
+            statusMark.stringValue = "旧"; statusMark.textColor = .secondaryLabelColor; statusMark.toolTip = "こちらが古い"
+        case .different?:
+            statusMark.stringValue = "≠"; statusMark.textColor = .systemRed; statusMark.toolTip = "日時は同じですが、サイズまたは種類が違います"
+        case .same?, nil:
+            statusMark.stringValue = ""; statusMark.toolTip = nil
+        }
+        statusMark.isHidden = statusMark.stringValue.isEmpty
+    }
+
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         let icon = NSImageView()
@@ -1102,7 +1426,11 @@ private final class BrowserNameCell: NSTableCellView {
         arrow.contentTintColor = .tertiaryLabelColor
         tagMark.image = NSImage(systemSymbolName: "tag", accessibilityDescription: "Finderタグあり")
         tagMark.contentTintColor = .secondaryLabelColor
-        for child in [icon, label, tagMark, arrow] { child.translatesAutoresizingMaskIntoConstraints = false; addSubview(child) }
+        statusMark.font = .systemFont(ofSize: 10, weight: .bold)
+        statusMark.isHidden = true
+        statusMark.setContentHuggingPriority(.required, for: .horizontal)
+        statusMark.setContentCompressionResistancePriority(.required, for: .horizontal)
+        for child in [icon, label, statusMark, tagMark, arrow] { child.translatesAutoresizingMaskIntoConstraints = false; addSubview(child) }
         imageView = icon
         textField = label
         NSLayoutConstraint.activate([
@@ -1111,7 +1439,9 @@ private final class BrowserNameCell: NSTableCellView {
             icon.widthAnchor.constraint(equalToConstant: 18), icon.heightAnchor.constraint(equalToConstant: 18),
             label.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 6),
             label.centerYAnchor.constraint(equalTo: centerYAnchor),
-            label.trailingAnchor.constraint(equalTo: tagMark.leadingAnchor, constant: -3),
+            label.trailingAnchor.constraint(equalTo: statusMark.leadingAnchor, constant: -3),
+            statusMark.centerYAnchor.constraint(equalTo: centerYAnchor),
+            statusMark.trailingAnchor.constraint(equalTo: tagMark.leadingAnchor, constant: -3),
             tagMark.centerYAnchor.constraint(equalTo: centerYAnchor),
             tagMark.widthAnchor.constraint(equalToConstant: 11), tagMark.heightAnchor.constraint(equalToConstant: 11),
             tagMark.trailingAnchor.constraint(equalTo: arrow.leadingAnchor, constant: -3),

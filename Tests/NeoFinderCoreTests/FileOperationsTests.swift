@@ -69,6 +69,57 @@ final class FileOperationsTests {
         #expect((try manager.contentsOfDirectory(atPath: destination.path).count) == (2))
     }
 
+    @Test func testReplaceMovesOldVersionToTrashAndUndoRestoresBoth() throws {
+        let item = try file("report.txt", content: "new version")
+        let existing = try file("report.txt", in: destination, content: "old version")
+        let replaced = try engine.copy([item], to: destination, conflict: .replace)
+        #expect((replaced.completed) == (1))
+        #expect(replaced.failures.isEmpty)
+        #expect((try contents(existing)) == ("new version"))
+        #expect((try manager.contentsOfDirectory(atPath: destination.path)) == (["report.txt"]))
+        let trashed = try manager.contentsOfDirectory(atPath: trashDirectory.path)
+        #expect((trashed.count) == (1))
+        #expect((try contents(trashDirectory.appendingPathComponent(trashed[0]))) == ("old version"))
+        // Undo removes the copy and then puts the old version back.
+        let undo = try engine.undoLast()
+        #expect((undo.completed) == (2))
+        #expect(undo.failures.isEmpty)
+        #expect((try contents(existing)) == ("old version"))
+        #expect((try contents(item)) == ("new version"))
+    }
+
+    @Test func testReplaceByMoveUndoReturnsSourceAndOldVersion() throws {
+        let item = try file("data.txt", content: "moved")
+        let existing = try file("data.txt", in: destination, content: "previous")
+        let moved = try engine.move([item], to: destination, conflict: .replace)
+        #expect((moved.completed) == (1))
+        #expect(!(manager.fileExists(atPath: item.path)))
+        #expect((try contents(existing)) == ("moved"))
+        #expect((try engine.undoLast().completed) == (2))
+        #expect((try contents(item)) == ("moved"))
+        #expect((try contents(existing)) == ("previous"))
+    }
+
+    @Test func testReplaceWithoutConflictBehavesLikePlainCopy() throws {
+        let item = try file("fresh.txt")
+        let report = try engine.copy([item], to: destination, conflict: .replace)
+        #expect((report.completed) == (1))
+        #expect(try manager.contentsOfDirectory(atPath: trashDirectory.path).isEmpty)
+        #expect((try engine.undoLast().completed) == (1))
+    }
+
+    @Test func testReplaceRefusesToTrashAFolderContainingTheSource() throws {
+        let folder = destination.appendingPathComponent("pack", isDirectory: true)
+        try manager.createDirectory(at: folder, withIntermediateDirectories: true)
+        let inner = try file("pack", in: folder, content: "inside")
+        let report = try engine.move([inner], to: destination, conflict: .replace)
+        #expect((report.completed) == (0))
+        #expect((report.failures.count) == (1))
+        #expect((try contents(inner)) == ("inside"))
+        #expect(try manager.contentsOfDirectory(atPath: trashDirectory.path).isEmpty)
+        #expect(!(engine.canUndo))
+    }
+
     @Test func testConflictCancelRetainsEarlierSuccess() throws {
         let first = try file("first.txt")
         let conflict = try file("conflict.txt")

@@ -57,7 +57,7 @@ public struct FileEntry: Identifiable, Sendable {
         }.map(\.entry)
     }
 
-    private static func comparisonKey(_ string: String) -> String {
+    static func comparisonKey(_ string: String) -> String {
         string.precomposedStringWithCanonicalMapping.folding(
             options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive],
             locale: Locale(identifier: "ja_JP")
@@ -94,6 +94,35 @@ public enum FolderReader {
     }
 }
 
+extension FolderReader {
+    /// Lists every descendant, named by its path relative to `url`. Packages are single items and
+    /// are not entered. Enumeration stops at `limit` entries so a huge tree cannot stall the app.
+    public static func flatContents(of url: URL, showHidden: Bool, limit: Int = 20_000) throws -> [FileEntry] {
+        let keys: Set<URLResourceKey> = [.isDirectoryKey, .isPackageKey, .isSymbolicLinkKey,
+                                       .fileSizeKey, .contentModificationDateKey, .tagNamesKey]
+        // Report an unreadable root the same way the ordinary listing does.
+        _ = try FileManager.default.contentsOfDirectory(atPath: url.path)
+        var options: FileManager.DirectoryEnumerationOptions = [.skipsPackageDescendants]
+        if !showHidden { options.insert(.skipsHiddenFiles) }
+        guard let enumerator = FileManager.default.enumerator(
+            at: url, includingPropertiesForKeys: Array(keys), options: options, errorHandler: { _, _ in true }
+        ) else { return [] }
+        let prefix = url.standardizedFileURL.path == "/" ? "/" : url.standardizedFileURL.path + "/"
+        var result: [FileEntry] = []
+        while result.count < limit, let child = enumerator.nextObject() as? URL {
+            let values = try? child.resourceValues(forKeys: keys)
+            let path = child.standardizedFileURL.path
+            let name = path.hasPrefix(prefix) ? String(path.dropFirst(prefix.count)) : child.lastPathComponent
+            result.append(FileEntry(url: child, name: name, isDirectory: values?.isDirectory ?? false,
+                                    isPackage: values?.isPackage ?? false,
+                                    isSymbolicLink: values?.isSymbolicLink ?? false,
+                                    size: Int64(values?.fileSize ?? 0),
+                                    modifiedAt: values?.contentModificationDate, tags: values?.tagNames ?? []))
+        }
+        return result
+    }
+}
+
 public enum FileSort: String, Codable, CaseIterable, Sendable { case name, date, size }
 public enum BrowserViewMode: String, Codable, Sendable { case list, columns }
 
@@ -105,6 +134,8 @@ public struct BrowserTab: Codable, Identifiable, Sendable {
     public var ascending: Bool
     public var history: [String]
     public var historyIndex: Int
+    /// A calendar-following path such as 「~/経理/{年度}年度/{MM}月」. See `PathTemplate`.
+    public var template: String?
     public var canGoBack: Bool { historyIndex > 0 && historyIndex < history.count }
     public var canGoForward: Bool { historyIndex >= 0 && historyIndex + 1 < history.count }
     public static let historyLimit = 100
@@ -148,7 +179,13 @@ public struct BrowserTab: Codable, Identifiable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, path, viewMode, sort, ascending, history, historyIndex
+        case id, path, viewMode, sort, ascending, history, historyIndex, template
+    }
+
+    /// The folder this tab's template points to on `date`; nil for an ordinary tab.
+    public func templatePath(on date: Date = Date()) -> String? {
+        guard let template, !template.isEmpty else { return nil }
+        return Self.cleanPath(PathTemplate.expand(template, date: date))
     }
 
     public init(from decoder: Decoder) throws {
@@ -160,6 +197,7 @@ public struct BrowserTab: Codable, Identifiable, Sendable {
         ascending = try values.decodeIfPresent(Bool.self, forKey: .ascending) ?? true
         history = try values.decodeIfPresent([String].self, forKey: .history) ?? [path]
         historyIndex = try values.decodeIfPresent(Int.self, forKey: .historyIndex) ?? 0
+        template = try values.decodeIfPresent(String.self, forKey: .template)
         repairHistory()
     }
 
@@ -292,10 +330,20 @@ public struct SavedSession: Codable, Sendable {
     public var favoriteGroups: [FavoriteGroup]
     public var showHidden: Bool
     public var relativeDates: Bool
+    /// Visited folders and transfer destinations, ranked by `RecentLocations.frecency`.
+    public var recents: [RecentLocation]
+    /// Destinations for the number keys 1–9 in triage mode; an empty string is an unassigned key.
+    public var triageSlots: [String]
+    /// Items collected on the shelf, as paths.
+    public var shelf: [String]
+    public static let triageSlotCount = 9
 
     public init(schemaVersion: Int = 1, current: WorkspaceState,
                 workspaces: [WorkspaceState] = [], favoriteGroups: [FavoriteGroup] = [],
                 showHidden: Bool = false, relativeDates: Bool = true) {
+        recents = []
+        triageSlots = Array(repeating: "", count: Self.triageSlotCount)
+        shelf = []
         self.schemaVersion = schemaVersion
         self.current = current
         self.workspaces = workspaces
@@ -306,6 +354,7 @@ public struct SavedSession: Codable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case schemaVersion, current, workspaces, favoriteGroups, showHidden, relativeDates
+        case recents, triageSlots, shelf
     }
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
@@ -315,6 +364,12 @@ public struct SavedSession: Codable, Sendable {
         favoriteGroups = try values.decodeIfPresent([FavoriteGroup].self, forKey: .favoriteGroups) ?? []
         showHidden = try values.decodeIfPresent(Bool.self, forKey: .showHidden) ?? false
         relativeDates = try values.decodeIfPresent(Bool.self, forKey: .relativeDates) ?? true
+        recents = (try? values.decodeIfPresent([RecentLocation].self, forKey: .recents)) ?? []
+        var slots = (try? values.decodeIfPresent([String].self, forKey: .triageSlots)) ?? []
+        slots = Array(slots.prefix(Self.triageSlotCount))
+        slots += Array(repeating: "", count: Self.triageSlotCount - slots.count)
+        triageSlots = slots
+        shelf = (try? values.decodeIfPresent([String].self, forKey: .shelf)) ?? []
         var workspaceIDs: Set<UUID> = []
         for index in workspaces.indices {
             if !workspaceIDs.insert(workspaces[index].id).inserted { workspaces[index].id = UUID() }
